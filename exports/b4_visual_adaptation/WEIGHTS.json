@@ -1,0 +1,28 @@
+{
+  "file": "b4_weights.pt",
+  "source_checkpoint": "runs/visual_ffn_qwen3vl8b_core_ablations_8k_u400_seed42_v1/B/checkpoints/update_0200.pt",
+  "evaluated_run": "runs/visual_ffn_qwen3vl8b_ablation_b_u200_full_v1",
+  "update": 200,
+  "training_data": "original 8000-QA B4 run; not the new 21751-QA recipe",
+  "backbone": "Qwen/Qwen3-VL-8B-Instruct",
+  "layers": [
+    8,
+    17,
+    26,
+    35
+  ],
+  "generation_scope": "prefill_only",
+  "architecture": {
+    "retrieval_query_source": "state",
+    "ffn_adaptation_type": "learned_output"
+  },
+  "format": "PyTorch state_dict",
+  "dtype": [
+    "torch.float32"
+  ],
+  "parameters": 19405440,
+  "tensors": 13,
+  "bytes": 77625980,
+  "contains_optimizer": false,
+  "contains_backbone": false
+}
