@@ -2,7 +2,7 @@
 
 Qwen3-VL-8B 的 B4 主实现：共享四头视觉读取与条件编码，在四个解码器层的原生 FFN 输出上添加条件增量。仅用于 prefill，后续 decode 保持原生计算。
 
-本目录包含独立的 B4 主实现、训练入口，以及已完成三数据集全量测试的 B4 u200 适配器权重。不依赖原实验仓库，没有附带评测、对比、验收、审计、资源门禁或服务器任务切换代码；Qwen3-VL-8B 原生权重与数据需自行准备。
+本目录包含独立的 B4 实现、训练入口和适配器权重。Qwen3-VL-8B 骨干与训练数据需自行准备。
 
 ## 文件
 
@@ -12,12 +12,12 @@ Qwen3-VL-8B 的 B4 主实现：共享四头视觉读取与条件编码，在四�
 | `b4/memory.py` | 原生视觉 memory、因果可见性、文本余弦先验、位置编码 |
 | `b4/inference.py` | Qwen3-VL prefill 接入与 FFN 输出注入 |
 | `train.py` | 单卡/torchrun 多卡训练、梯度累积、保存与恢复 |
-| `b4/training.py` | 原损失、余弦日程、选择性激活检查点与视觉特征复用 |
+| `b4/training.py` | 全词表 CE + hinge 损失、余弦日程、选择性激活检查点与视觉特征复用 |
 | `b4/data.py` | MCQ 输入、整视频 CPU 预处理和有界预加载 |
-| `prepare_data.py` | 将原全题训练清单及训练标签转换为 JSONL |
+| `prepare_data.py` | 将训练清单及训练标签转换为 JSONL |
 | `watch.py` | 读取训练状态，显示实时进度 |
-| `b4_weights.pt` | 原 B4 u200 的 FP32 适配器权重，纯 state_dict |
-| `WEIGHTS.json` | 权重来源、训练节点、结构与文件大小 |
+| `b4_weights.pt` | B4 的 FP32 适配器权重，纯 state_dict |
+| `WEIGHTS.json` | 权重格式、结构、精度与文件大小 |
 
 ## 架构
 
@@ -58,7 +58,7 @@ output_l   = native_FFN(x) + delta_l
 
 ## 接入
 
-运行环境参考原实现：Python 3.10、PyTorch 2.8.0、Transformers 4.57.6。进入本目录后安装依赖：
+运行环境：Python 3.10、PyTorch 2.8.0、Transformers 4.57.6。进入本目录后安装依赖：
 
 ```sh
 pip install -r requirements.txt
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 
 下面展示模型接入方式。`inputs` 是 Qwen3-VL 原生 processor 已准备好并放到模型设备上的输入，包含 `input_ids`、`attention_mask`、视觉 pixels 与对应 grid；视频解码和采样由调用端处理。
 
-`question_option_positions` 是**视觉 token 展开后的最终 input_ids** 中题干、选项文本 token 的位置列表。它不包括系统文本、视觉占位 token、模板特殊 token 或答案；如有题内图片，位置列表跳过图片段。代码另外加入 `len(input_ids[0])-1`，即生成首答案所用的 prompt 最后位置。此位置表由调用端沿用原 prompt 分词结果提供，本包不包含数据集专用题目解析和评分逻辑。
+`question_option_positions` 是**视觉 token 展开后的最终 input_ids** 中题干、选项文本 token 的位置列表。它不包括系统文本、视觉占位 token、模板特殊 token 或答案；如有题内图片，位置列表跳过图片段。代码另外加入 `len(input_ids[0])-1`，即生成首答案所用的 prompt 最后位置。此位置表由调用端根据 prompt 分词结果提供，本包不包含数据集专用题目解析和评分逻辑。
 
 ```python
 import torch
@@ -95,38 +95,42 @@ with torch.inference_mode(), B4Inference(
 
 每个上下文仅处理一个完整、无 padding 的 prompt（batch=1），使用新的生成 cache。`max_new_tokens` 由调用端根据任务设置；示例不定义数据集的评估口径。解码器层与适配器应在同一设备上。本接入不处理 beam expansion、分段 prefill 或外部历史 KV；这些输入条件由调用端负责。
 
-参数名沿用 B4：`W_Q`、`W_K`、`E_layer`、`W_C`、`b_C` 和 `output_adapters.{0..3}.{U,V}`。已有研究 checkpoint 的适配器 state_dict 位于 `checkpoint['model']`；将这个字典作为权重载入即可。新建适配器的输出矩阵 `V` 初始为零，必须加载已训练的 B4 权重才能获得其适配效果。
+参数名：`W_Q`、`W_K`、`E_layer`、`W_C`、`b_C` 和 `output_adapters.{0..3}.{U,V}`。完整训练 checkpoint 的适配器 state_dict 位于 `checkpoint['model']`；将这个字典作为权重载入即可。新建适配器的输出矩阵 `V` 初始为零，必须加载已训练的 B4 权重才能获得其适配效果。
 
-## 随包权重
+## 权重
 
-`b4_weights.pt` 提取自原 **8K 训练的 B4 u200**，是 `visual_ffn_qwen3vl8b_ablation_b_u200_full_v1` 完成 3,625 条正式生成时使用的权重。它不是下述新 21K 训练配置的训练产物。只保存 13 个 FP32 参数张量，共 19,405,440 个参数；不包含 8B 骨干、AdamW、RNG 或训练数据，也没有降精度。
-
-原全量评估的三域宏平均为 53.76%；这属于原实验入口的已保存结果，不表示精简包已重新跑过该评估。权重可直接按上面的 `torch.load(..., weights_only=True)` 示例加载。
-
-该文件约 **74.03 MiB**，可通过普通 **Git push** 上传；GitHub 对超过 50 MiB 的文件会提示，超过 100 MiB 才阻止普通 Git 上传。网页向仓库上传文件的限制是 25 MiB，因此不能直接在网页上传这个权重。此大小不强制使用 Git LFS。[GitHub 官方说明](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github)
+`b4_weights.pt` 为 B4 适配器权重，格式是可由 `torch.load(..., weights_only=True)` 加载的纯 `state_dict`。文件包含 13 个 FP32 参数张量，共 19,405,440 个参数，约 **74.03 MiB**；不包含骨干、优化器、RNG 或训练数据。结构和格式信息见 `WEIGHTS.json`。
 
 `.gitignore` 已为根目录的 `b4_weights.pt` 单独放行，其他训练 checkpoint 和输出目录仍忽略。
 
-## 21K 全题训练
+## 训练
 
-最终默认配置如下。它是在 B4 架构上使用全题训练配置，不是原 8K/u200 训练的位级重放。训练入口默认从新初始化的 B4 开始，不自动加载随包 u200 权重；`--resume` 用于完整训练 checkpoint 的断点恢复。
+训练入口默认从新初始化的 B4 开始。`--resume` 用于恢复本训练目标保存的完整 checkpoint；纯适配器权重用于推理加载。
 
 | 项目 | 默认值 |
 |---|---|
-| 训练集 | 原 8,000 个训练视频的全部 21,751 个问答，保留清单顺序 |
-| 帧数 | 原 128 帧清单；短视频沿用原实际帧数 |
+| 训练集 | VideoKR 训练集，保留输入清单顺序；步数按实际题数计算 |
+| 帧数 | 最多 128 帧；提供帧索引时以清单为准 |
 | 训练参数 | 仅 B4 新增参数；原生视觉编码器和语言骨干冻结 |
 | Epoch | 1 |
 | 全局 batch | **8**，每卡 microbatch=1，多卡梯度求和后除以实际题数 |
-| 更新次数 | **2,719**，最后一批 **7** 题，不补题也不丢弃 |
+| 更新次数 | 21,751 题时为 **2,719**，最后一批 **7** 题，不补题也不丢弃 |
 | 学习率 | 峰值 **1e-4**，余弦衰减到 0 |
-| Warmup | 总步数的 **3%** 向上取整，即 **82** 步 |
+| Warmup | 总步数的 **3%** 向上取整；2,719 步时为 **82** 步 |
 | 优化器 | AdamW，betas=(0.9,0.999)，eps=1e-8，weight_decay=0，clip=1 |
-| 损失 | 前 **50** 次更新为原始全词表 CE + 0.1×hinge，之后使用原去尺度复合损失 |
+| 损失 | 全程使用原始全词表 CE + 0.1×hinge，margin=0.5 |
 | 精度 | BF16 骨干、FP32 B4 和梯度；LM head 使用原生 BF16 前向与分块 FP32 反向 |
 | 保存 | 每 100 步和最终步，保存适配器、优化器、日程位置、数据进度、各卡 RNG |
 
-`raw_steps=50` 沿用此前确认的全题设置，按 optimizer 更新计数；改变 batch 不会自动改变这个值。去尺度阶段只对**合法选项 logits**中心化并除以可微 RMS，损失为选项 CE + 0.1×归一化 margin hinge + 合法选项概率质量损失。它不是纯 CE SFT。答案只参与首答案位置的损失，不拼进输入 prompt。
+令 `z` 为首答案预测位置的原始全词表 logits，`y` 为正确选项字母的 token ID：
+
+```text
+CE     = logsumexp(z) - z[y]
+margin = z[y] - max(z[j] for j != y)
+loss   = CE + 0.1 * max(0, 0.5 - margin)
+```
+
+所有更新使用同一个损失，直接在未归一化的全词表 logits 上计算；hinge 的竞争项包含除正确答案 token 外的全部词表。模型内部 Query、Key 和条件编码的 RMS 属于架构计算。答案只参与首答案位置的损失，不拼进输入 prompt。
 
 ### 数据
 
@@ -136,9 +140,9 @@ with torch.inference_mode(), B4Inference(
 {"id":"sample_001","video":"/path/to/video.mp4","question":"What happens next?","options":["A. First choice","B. Second choice","C. Third choice","D. Fourth choice"],"answer":"B","frame_indices":[0,4,8,12]}
 ```
 
-例子的 4 帧仅展示字段格式；正式全题训练请传入原 **128 帧版本**的 `FRAME_MANIFEST.json`。提供 `frame_indices` 时直接使用这些索引，`--max-frames` 不覆盖已有清单。只有未给出索引的新数据，才按 2 FPS、最多 128 帧均匀采样。
+例子的 4 帧仅展示字段格式；训练时可传入 **128 帧版本**的 `FRAME_MANIFEST.json`。提供 `frame_indices` 时直接使用这些索引，`--max-frames` 不覆盖已有清单。只有未给出索引的新数据，才按 2 FPS、最多 128 帧均匀采样。
 
-将原训练清单转换为本包的格式：
+将训练清单转换为本包的格式：
 
 ```sh
 python prepare_data.py \
@@ -148,11 +152,11 @@ python prepare_data.py \
   --output data/train_21k.jsonl
 ```
 
-原标签文件以 question ID 的 SHA256 命名，转换脚本仅用它定位文件，不执行内容哈希、身份对比或验收。视频搬到其他机器后可增加 `--video-root /path/to/videos`，按原 `meta.file_name` 重写路径。转换器只读取提供的训练清单，其他集合不会加入。训练数据和运行输出已加入 `.gitignore`；仅上述随包 B4 u200 权重允许上传。
+标签文件以 question ID 的 SHA256 命名，转换脚本用它定位文件。视频搬到其他机器后可增加 `--video-root /path/to/videos`，按 `meta.file_name` 重写路径。转换器只读取提供的训练清单；请仅传入训练集，验证集和测试集不参与梯度训练。训练数据和运行输出已加入 `.gitignore`，根目录的 `b4_weights.pt` 单独放行。
 
 ### 启动与恢复
 
-默认语言注意力为 SDPA、视觉注意力为 FlashAttention2，沿用原 Qwen 配置；FlashAttention2 需在目标 CUDA 环境单独安装。若使用 `--vision-attention sdpa`，则明确切换视觉注意力实现。
+默认语言注意力为 SDPA、视觉注意力为 FlashAttention2；FlashAttention2 需在目标 CUDA 环境单独安装。若使用 `--vision-attention sdpa`，则明确切换视觉注意力实现。
 
 双卡启动示例（显卡编号由调用者选择）：
 
@@ -160,15 +164,15 @@ python prepare_data.py \
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py \
   --model /path/to/Qwen3-VL-8B-Instruct \
   --data data/train_21k.jsonl \
-  --output outputs/b4_allqa128_b8_cos1em4
+  --output outputs/b4_train
 ```
 
 单卡将上述命令换为 `CUDA_VISIBLE_DEVICES=0 python train.py ...`。全局 batch 始终为 8，不会乘以卡数。每个优化批次内按视频分组分配给 GPU，同视频题逐题前向、反向；所有卡完成后仅同步 B4 梯度，再统一裁剪与更新。
 
-恢复时使用相同卡数，添加 `--resume outputs/b4_allqa128_b8_cos1em4/checkpoint_0100.pt`。恢复已保存的模型、AdamW、步数、RNG 与科学配置，从下一批继续，不重复已保存批次。`b4_weights.pt` 是最新保存节点的纯适配器权重，可直接用于上面的推理示例。
+恢复时使用相同卡数和同一训练数据清单，添加 `--resume outputs/b4_train/checkpoint_0100.pt`。恢复已保存的模型、AdamW、步数、各卡 RNG、视觉注意力实现与训练配置，从下一批继续。入口检查保存的损失标识与卡数；不兼容或缺少损失标识的 checkpoint 会在初始化 CUDA 前报错。输出目录中的 `b4_weights.pt` 是最新保存节点的纯适配器权重，可用于上面的推理示例。
 
 ```sh
-python watch.py outputs/b4_allqa128_b8_cos1em4
+python watch.py outputs/b4_train
 ```
 
 状态包括加载、等待输入、前向/反向、优化器更新、保存、完成，以及 PID、每卡进度、loss、原始 CE、LR、batch 耗时、CPU 等待和 ETA。心跳超过预期未更新时应检查终端错误，不能仅凭状态文件的 RUNNING 判断存活；具体异常由 Python 直接输出，不自动重试或跳过样本。
@@ -182,15 +186,12 @@ python watch.py outputs/b4_allqa128_b8_cos1em4
 - 非 reentrant 选择性激活检查点保留融合注意力输出，重算其他解码器运算；冻结骨干仍保留传向前层 B4 的梯度路径。
 - 仅对 prompt 最后位置计算全词表 logits；每次更新只同步一份扁平 B4 梯度。
 
-CPU 缓存和视觉特征缓存均限当前视频组，不建立全数据集磁盘缓存；没有复制研究工程的 GPU 占位、自动切换和 CPU 激活 offload 控制器。本包不附带 Dev/全集评价，训练期间也不自动运行这些评价。
+CPU 缓存和视觉特征缓存均限当前视频组，不建立全数据集磁盘缓存。训练采用每批次内的视频分组与各卡有界预加载队列，所有卡在梯度更新前同步。本包不附带数据集评估入口，训练期间也不自动评价。
 
-## 实现来源
+## CPU 检查
 
-此版本提取原 B4 的 `learned_output` 分支，移除其他架构选项和实验管理依赖：
+```sh
+python -m unittest discover -s tests -v
+```
 
-- `visual_ffn_core_ablations_v1/model.py`：B 的状态读取、条件编码与输出适配器。
-- `visual_ffn_core_ablations_v1/hooks.py`：原生 FFN 输出之后的 prefill 注入。
-- `visual_ffn_v1.py`、`visual_ffn_v1_speed_v1.py`、`visual_ffn_v1_steady_v5.py`：RMS、视觉 memory、余弦先验、位置编码、FP32 分块读取与缓存。
-- `visual_ffn_ablation_b_full_v1/runtime.py`：从实际 Qwen3-VL prefill embedding 建立 memory 的接入位置。
-
-保留一次 prompt 内的 FP32 视觉缓冲、RMS 缓冲、因果掩码和 Key 复用，以及 16 Query 分块读取。训练部分参考 `visual_ffn_qwen8b_allqa128_cost_r5`、`visual_ffn_qwen8b_allqa32_v1`、`visual_ffn_core_ablations_8k_4gpu_v2` 的实际路径，以及原 `visual_ffn_scalefree_v1` 损失。没有附带服务器运行记录。该精简包尚未执行完整 GPU 训练或重跑正式 benchmark，不将代码提取宣称为新的精度或速度结果。
+检查损失数值与梯度、等值 logits 的有限性、缩放敏感性及断点恢复的损失配置兼容性。完整 GPU 训练和 benchmark 需在目标环境中另行运行。

@@ -1,9 +1,5 @@
 {
   "file": "b4_weights.pt",
-  "source_checkpoint": "runs/visual_ffn_qwen3vl8b_core_ablations_8k_u400_seed42_v1/B/checkpoints/update_0200.pt",
-  "evaluated_run": "runs/visual_ffn_qwen3vl8b_ablation_b_u200_full_v1",
-  "update": 200,
-  "training_data": "original 8000-QA B4 run; not the new 21751-QA recipe",
   "backbone": "Qwen/Qwen3-VL-8B-Instruct",
   "layers": [
     8,

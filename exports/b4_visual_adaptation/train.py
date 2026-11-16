@@ -1,4 +1,4 @@
-"""Train only B4 on the ordered 21K multiple-choice question manifest."""
+"""Train B4 on ordered video multiple-choice questions with full-vocabulary CE/hinge."""
 
 import argparse
 import json
@@ -14,7 +14,10 @@ import torch.distributed as dist
 
 from b4 import B4Adapter, B4Inference
 from b4.data import Prefetch, read_rows, video_jobs
-from b4.training import FrozenHead, FrozenVideo, answer_loss, learning_rate, mean_gradients, selective_context
+from b4.training import (
+    LOSS_NAME, FrozenHead, FrozenVideo, answer_loss, learning_rate,
+    mean_gradients, selective_context,
+)
 
 
 class Progress:
@@ -47,6 +50,19 @@ class Progress:
         self.thread.join()
 
 
+def validate_resume(checkpoint, world):
+    """Require the same training objective and per-rank RNG layout."""
+    saved = checkpoint.get('config', {})
+    if saved.get('loss') != LOSS_NAME:
+        raise ValueError(
+            f"Checkpoint loss {saved.get('loss')!r} does not match {LOSS_NAME!r}. "
+            "Use a new output directory to start this training objective."
+        )
+    if saved.get('world_size') != world or len(checkpoint.get('rng', [])) != world:
+        raise ValueError('Resume requires the saved GPU count and one RNG state per rank.')
+    return saved
+
+
 def save(output, adapter, optimizer, config, update, scheduler, rank, world):
     rng = dict(python=random.getstate(), torch=torch.get_rng_state(), cuda=torch.cuda.get_rng_state())
     rngs = [None] * world
@@ -76,13 +92,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='Qwen/Qwen3-VL-8B-Instruct')
     parser.add_argument('--data', required=True, help='Ordered training-only JSONL, with answers and frame indices')
-    parser.add_argument('--output', default='outputs/b4_allqa128_b8_cos1em4')
+    parser.add_argument('--output', default='outputs/b4_train')
     parser.add_argument('--batch-size', type=int, default=8, help='Global question count per optimizer update')
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--max-frames', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--warmup-ratio', type=float, default=0.03)
-    parser.add_argument('--raw-steps', type=int, default=50)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--cpu-workers', type=int, default=1, help='Spawned CPU preprocessors per GPU')
     parser.add_argument('--prefetch', type=int, default=2, help='Maximum outstanding video jobs per GPU')
@@ -92,32 +107,35 @@ def main():
     args = parser.parse_args()
     rank, local, world = (int(os.environ.get(k, '0' if k != 'WORLD_SIZE' else '1'))
                           for k in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE'))
+    # Check checkpoint compatibility before CUDA initialization or output writes.
+    resume = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
+    config = dict(vars(args))
+    if resume is not None:
+        saved = validate_resume(resume, world)
+        # Restore the training configuration; paths may move between machines.
+        for name in ('batch_size', 'epochs', 'max_frames', 'lr', 'warmup_ratio', 'seed',
+                     'vision_attention'):
+            config[name] = saved[name]
+    rows = read_rows(args.data)
+    batch = config['batch_size']
+    per_epoch = math.ceil(len(rows) / batch)
+    total = per_epoch * config['epochs']
+    warmup = math.ceil(total * config['warmup_ratio'])
+    start = resume['update'] if resume is not None else 0
+    config.update(question_count=len(rows), total_steps=total, warmup_steps=warmup, world_size=world,
+                  microbatch_per_gpu=1, training_scope='B4_only_prefill', loss=LOSS_NAME)
     device = torch.device('cuda', local)
     torch.cuda.set_device(device)
     if world > 1:
         dist.init_process_group('nccl', device_id=device)
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    random.seed(config['seed'])
+    torch.manual_seed(config['seed'])
+    torch.cuda.manual_seed(config['seed'])
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     status = Progress(output, rank, device)
-    resume = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
-    config = dict(vars(args))
-    if resume:
-        # Continue the saved scientific configuration; paths may move between machines.
-        for name in ('batch_size', 'epochs', 'max_frames', 'lr', 'warmup_ratio', 'raw_steps', 'seed'):
-            config[name] = resume['config'][name]
-    rows = read_rows(args.data)
-    batch = config['batch_size']
-    per_epoch = math.ceil(len(rows) / batch)
-    total = per_epoch * config['epochs']
-    warmup = math.ceil(total * config['warmup_ratio'])
-    start = resume['update'] if resume else 0
-    config.update(question_count=len(rows), total_steps=total, warmup_steps=warmup, world_size=world,
-                  microbatch_per_gpu=1, training_scope='B4_only_prefill', loss='raw_then_centered_RMS')
     if rank == 0:
         (output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
         print(f'{len(rows)} QA | batch={batch} | {total} updates | warmup={warmup} | frames<={config["max_frames"]}', flush=True)
@@ -133,7 +151,7 @@ def main():
     adapter = B4Adapter().to(device)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model, torch_dtype=torch.bfloat16,
-        attn_implementation={'text_config': 'sdpa', 'vision_config': args.vision_attention},
+        attn_implementation={'text_config': 'sdpa', 'vision_config': config['vision_attention']},
     ).to(device).eval().requires_grad_(False)
     lm = model.model.language_model
     lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={
@@ -141,7 +159,7 @@ def main():
     lm.train()  # Activate layer checkpointing; Qwen's attention dropout is zero.
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=config['lr'], betas=(0.9, 0.999),
                                  eps=1e-8, weight_decay=0)
-    if resume:
+    if resume is not None:
         adapter.load_state_dict(resume['model'])
         optimizer.load_state_dict(resume['optimizer'])
         rng = resume['rng'][rank]
@@ -173,8 +191,7 @@ def main():
                     with B4Inference(model, adapter, inputs, question['positions']):
                         hidden = model.model(**inputs, use_cache=False, return_dict=True).last_hidden_state
                         logits = FrozenHead.apply(hidden[0, -1].float(), model.lm_head.weight)
-                        loss, raw_ce = answer_loss(logits, question['gold'], question['option_ids'],
-                                                   update, config['raw_steps'])
+                        loss, raw_ce = answer_loss(logits, question['gold'])
                         loss.backward()
                         loss_sum += torch.stack((loss.detach(), raw_ce.detach()))
                     completed += 1

@@ -8,29 +8,22 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 
+LOSS_NAME = 'full_vocab_ce_hinge_v1'
+
+
 def learning_rate(update, total, warmup, peak=1e-4):
     if update <= warmup:
         return peak * update / max(warmup, 1)
     return peak * 0.5 * (1 + math.cos(math.pi * (update - warmup) / (total - warmup)))
 
 
-def answer_loss(logits, gold, option_ids, update, raw_steps=50):
-    """Original answer-position CE/hinge, followed by differentiable RMS loss."""
+def answer_loss(logits, gold):
+    """Full-vocabulary CE plus a margin hinge on unnormalized logits."""
     z = logits.float()
-    full_lse = torch.logsumexp(z, dim=0)
-    raw_ce = full_lse - z[gold]
-    if update <= raw_steps:
-        wrong = torch.cat((z[:gold], z[gold + 1:])).max()
-        return raw_ce + 0.1 * F.relu(0.5 - (z[gold] - wrong)), raw_ce
-    legal = z[option_ids]
-    centered = legal - legal.mean()
-    normalized = centered / centered.square().mean().sqrt()
-    index = option_ids.index(gold)
-    wrong = torch.cat((normalized[:index], normalized[index + 1:])).max()
-    ce = torch.logsumexp(normalized, dim=0) - normalized[index]
-    hinge = F.relu(0.5 - (normalized[index] - wrong))
-    format_loss = full_lse - torch.logsumexp(legal, dim=0)
-    return ce + 0.1 * hinge + format_loss, raw_ce
+    raw_ce = torch.logsumexp(z, dim=0) - z[gold]
+    wrong = torch.cat((z[:gold], z[gold + 1:])).max()
+    hinge = F.relu(0.5 - (z[gold] - wrong))
+    return raw_ce + 0.1 * hinge, raw_ce
 
 
 def selective_context():
